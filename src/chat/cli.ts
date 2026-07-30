@@ -6,6 +6,8 @@ import { generateEmbeddings } from '../rag/embeddings.js'
 import { processDirectory } from '../rag/chunker.js'
 import { resetStore } from '../rag/retriever.js'
 import { VectorStore } from '../rag/vector.js'
+import { checkGuardrails, createRateLimiter } from '../security/guardrails.js'
+import { calculateCost } from '../utils/cost-calculator.js'
 import config from '../config.js'
 
 async function ingestDocs(docsPath: string): Promise<void> {
@@ -42,6 +44,7 @@ export async function startCLI(): Promise<void> {
   })
 
   const devAssistantAgent = new DevAssistantAgent()
+  const rateLimiter = createRateLimiter()
 
   console.log('╔════════════════════════════════════════╗')
   console.log('║         DevAssistant v1.0              ║')
@@ -64,22 +67,37 @@ export async function startCLI(): Promise<void> {
 
       if (userInput === '/stats') {
         const stats = devAssistantAgent.getStats()
+        const sessionCost = calculateCost({
+          inputTokens: stats.inputTokens,
+          outputTokens: stats.outputTokens,
+          model: config.anthropicModel
+        })
+
         console.log(`\n📊 Estadísticas de la conversación:`)
         console.log(`🔸 Turnos: ${stats.turns}`)
         console.log(`🔸 Tokens de entrada acumulados: ${stats.inputTokens}`)
         console.log(`🔸 Tokens de salida acumulados: ${stats.outputTokens}`)
+        console.log(`🔸 Costo estimado de sesión: ${sessionCost.formatted}`)
         console.log(`🔸 Tools calls en útlimo turno: ${stats.toolCallsLastTurn}`)
+        console.log('')
         promptUser()
         return
       }
 
       if (userInput === '/exit') {
         const stats = devAssistantAgent.getStats()
+        const sessionCost = calculateCost({
+          inputTokens: stats.inputTokens,
+          outputTokens: stats.outputTokens,
+          model: config.anthropicModel
+        })
+
         console.log('\n👋 ¡Hasta luego!')
         console.log(`\n📝 Resumen:`)
         console.log(`🔸 ${stats.turns} turno${stats.turns > 1 ? 's' : ''}`)
         console.log(`🔸 ${stats.inputTokens} tokens de entrada`)
         console.log(`🔸 ${stats.outputTokens} tokens de salida`)
+        console.log(`🔸 Costo estimado: ${sessionCost.formatted}`)
         rl.close()
         return
       }
@@ -119,8 +137,17 @@ export async function startCLI(): Promise<void> {
       }
 
       try {
+        const guardrail = checkGuardrails(userInput, rateLimiter)
+        if (!guardrail.safe) {
+          console.log(`\n${guardrail.reason}`)
+          promptUser()
+          return
+        }
+
+        const secureText = guardrail.sanitized
+
         process.stdout.write('\nDevAssistantAgent:')
-        const response = await devAssistantAgent.chat(userInput, (fragment) => process.stdout.write(fragment))
+        const response = await devAssistantAgent.chat(secureText, (fragment) => process.stdout.write(fragment))
         process.stdout.write('\n')
         if (response.toolsUsed.length > 0) {
           const uniqueTools = [...new Set(response.toolsUsed)]
